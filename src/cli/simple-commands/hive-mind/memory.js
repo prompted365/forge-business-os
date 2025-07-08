@@ -140,6 +140,10 @@ class OptimizedLRUCache {
       evictions: this.evictions
     };
   }
+
+  forEach(callback) {
+    this.cache.forEach(callback);
+  }
 }
 
 /**
@@ -178,6 +182,11 @@ export class CollectiveMemory extends EventEmitter {
     
     this.db = null;
     this.gcTimer = null;
+    
+    // Concurrency control flags to prevent background task conflicts
+    this._backgroundTaskRunning = false;
+    this._criticalOperationInProgress = false;
+    this._backgroundTaskQueue = [];
     
     // Optimized cache with LRU eviction
     this.cache = new OptimizedLRUCache(this.config.cacheSize, this.config.cacheMemoryMB);
@@ -355,16 +364,64 @@ export class CollectiveMemory extends EventEmitter {
    */
   _startOptimizationTimers() {
     // Main garbage collection
-    this.gcTimer = setInterval(() => this._garbageCollect(), this.config.gcInterval);
+    this.gcTimer = setInterval(() => {
+      this._runBackgroundTask('gc', () => this._garbageCollect());
+    }, this.config.gcInterval);
     
     // Database optimization
-    this.optimizeTimer = setInterval(() => this._optimizeDatabase(), 1800000); // 30 minutes
+    this.optimizeTimer = setInterval(() => {
+      this._runBackgroundTask('optimize', () => this._optimizeDatabase());
+    }, 1800000); // 30 minutes
     
     // Cache cleanup
-    this.cacheTimer = setInterval(() => this._optimizeCache(), 60000); // 1 minute
+    this.cacheTimer = setInterval(() => {
+      this._runBackgroundTask('cache', () => this._optimizeCache());
+    }, 60000); // 1 minute
     
-    // Performance monitoring
+    // Performance monitoring (this is lightweight, no throttling needed)
     this.metricsTimer = setInterval(() => this._updatePerformanceMetrics(), 30000); // 30 seconds
+  }
+  
+  /**
+   * Run background task with concurrency control
+   */
+  _runBackgroundTask(taskName, taskFunction) {
+    // Skip if critical operation is in progress
+    if (this._criticalOperationInProgress) {
+      this.emit('background:skipped', { task: taskName, reason: 'critical_operation' });
+      return;
+    }
+    
+    // Skip if another background task is already running
+    if (this._backgroundTaskRunning) {
+      // Queue for later if important
+      if (['gc', 'optimize'].includes(taskName)) {
+        this._backgroundTaskQueue.push({ name: taskName, fn: taskFunction });
+      }
+      this.emit('background:skipped', { task: taskName, reason: 'task_running' });
+      return;
+    }
+    
+    // Execute the background task
+    this._backgroundTaskRunning = true;
+    
+    try {
+      const startTime = performance.now();
+      taskFunction();
+      const duration = performance.now() - startTime;
+      
+      this.emit('background:completed', { task: taskName, duration });
+      
+      // Process queued tasks if any
+      if (this._backgroundTaskQueue.length > 0 && !this._criticalOperationInProgress) {
+        const nextTask = this._backgroundTaskQueue.shift();
+        setImmediate(() => this._runBackgroundTask(nextTask.name, nextTask.fn));
+      }
+    } catch (error) {
+      this.emit('background:error', { task: taskName, error });
+    } finally {
+      this._backgroundTaskRunning = false;
+    }
   }
 
   /**
@@ -381,6 +438,9 @@ export class CollectiveMemory extends EventEmitter {
    * Store data in collective memory
    */
   async store(key, value, type = 'knowledge', metadata = {}) {
+    // Set critical operation flag to prevent background tasks
+    this._criticalOperationInProgress = true;
+    
     try {
       const serialized = JSON.stringify(value);
       const size = Buffer.byteLength(serialized);
@@ -461,6 +521,15 @@ export class CollectiveMemory extends EventEmitter {
     } catch (error) {
       this.emit('error', error);
       throw error;
+    } finally {
+      // Clear critical operation flag
+      this._criticalOperationInProgress = false;
+      
+      // Process any queued background tasks
+      if (this._backgroundTaskQueue.length > 0 && !this._backgroundTaskRunning) {
+        const nextTask = this._backgroundTaskQueue.shift();
+        setImmediate(() => this._runBackgroundTask(nextTask.name, nextTask.fn));
+      }
     }
   }
   
@@ -468,6 +537,9 @@ export class CollectiveMemory extends EventEmitter {
    * Retrieve data from collective memory
    */
   async retrieve(key) {
+    // Set critical operation flag to prevent background tasks
+    this._criticalOperationInProgress = true;
+    
     try {
       // Check cache first
       if (this.cache.has(key)) {
@@ -520,6 +592,15 @@ export class CollectiveMemory extends EventEmitter {
     } catch (error) {
       this.emit('error', error);
       throw error;
+    } finally {
+      // Clear critical operation flag
+      this._criticalOperationInProgress = false;
+      
+      // Process any queued background tasks
+      if (this._backgroundTaskQueue.length > 0 && !this._backgroundTaskRunning) {
+        const nextTask = this._backgroundTaskQueue.shift();
+        setImmediate(() => this._runBackgroundTask(nextTask.name, nextTask.fn));
+      }
     }
   }
   
@@ -527,6 +608,9 @@ export class CollectiveMemory extends EventEmitter {
    * Search collective memory
    */
   async search(pattern, options = {}) {
+    // Set critical operation flag to prevent background tasks
+    this._criticalOperationInProgress = true;
+    
     try {
       const limit = options.limit || 50;
       const type = options.type || null;
@@ -559,6 +643,15 @@ export class CollectiveMemory extends EventEmitter {
     } catch (error) {
       this.emit('error', error);
       throw error;
+    } finally {
+      // Clear critical operation flag
+      this._criticalOperationInProgress = false;
+      
+      // Process any queued background tasks
+      if (this._backgroundTaskQueue.length > 0 && !this._backgroundTaskRunning) {
+        const nextTask = this._backgroundTaskQueue.shift();
+        setImmediate(() => this._runBackgroundTask(nextTask.name, nextTask.fn));
+      }
     }
   }
   
@@ -1028,6 +1121,51 @@ export class CollectiveMemory extends EventEmitter {
   }
   
   /**
+   * Force run a specific background task (bypasses concurrency control)
+   */
+  async forceBackgroundTask(taskName) {
+    const tasks = {
+      'gc': () => this._garbageCollect(),
+      'optimize': () => this._optimizeDatabase(),
+      'cache': () => this._optimizeCache()
+    };
+    
+    const taskFn = tasks[taskName];
+    if (!taskFn) {
+      throw new Error(`Unknown background task: ${taskName}`);
+    }
+    
+    // Wait for any critical operations to complete
+    while (this._criticalOperationInProgress) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    // Execute the task
+    const startTime = performance.now();
+    try {
+      await taskFn();
+      const duration = performance.now() - startTime;
+      this.emit('background:forced', { task: taskName, duration });
+      return { success: true, duration };
+    } catch (error) {
+      this.emit('background:error', { task: taskName, error });
+      throw error;
+    }
+  }
+  
+  /**
+   * Get background task status
+   */
+  getBackgroundTaskStatus() {
+    return {
+      isRunning: this._backgroundTaskRunning,
+      criticalOperationInProgress: this._criticalOperationInProgress,
+      queuedTasks: this._backgroundTaskQueue.map(t => t.name),
+      lastGC: new Date(this.state.lastGC).toISOString()
+    };
+  }
+  
+  /**
    * Enhanced shutdown with cleanup
    */
   close() {
@@ -1093,10 +1231,12 @@ export class CollectiveMemory extends EventEmitter {
    */
   async healthCheck() {
     const analytics = this.getAnalytics();
+    const backgroundStatus = this.getBackgroundTaskStatus();
     const health = {
       status: 'healthy',
       issues: [],
-      recommendations: []
+      recommendations: [],
+      backgroundTasks: backgroundStatus
     };
     
     // Check cache hit rate
@@ -1116,6 +1256,19 @@ export class CollectiveMemory extends EventEmitter {
     if (analytics.performance.avgQueryTime > 100) {
       health.issues.push('Slow query performance');
       health.recommendations.push('Consider database optimization or indexing');
+    }
+    
+    // Check background task queue
+    if (backgroundStatus.queuedTasks.length > 3) {
+      health.issues.push('Background task queue backlog');
+      health.recommendations.push('Consider force-running critical tasks during low activity');
+    }
+    
+    // Check time since last GC
+    const timeSinceGC = Date.now() - this.state.lastGC;
+    if (timeSinceGC > this.config.gcInterval * 2) {
+      health.issues.push('Garbage collection overdue');
+      health.recommendations.push('Run forceBackgroundTask("gc") to manually trigger cleanup');
     }
     
     return health;

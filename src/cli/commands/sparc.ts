@@ -1,4 +1,5 @@
 import { getErrorMessage } from '../../utils/error-handler.js';
+import { createSafeReadlineInterface } from '../../utils/tty-error-handler.js';
 import { success, error, warning, info } from "../cli-core.js";
 import type { CommandContext } from "../cli-core.js";
 import chalk from "chalk";
@@ -238,11 +239,12 @@ async function runTddFlow(ctx: CommandContext): Promise<void> {
       if (ctx.flags.sequential !== false) {
         console.log("Phase completed. Press Enter to continue to next phase, or Ctrl+C to stop...");
         await new Promise<void>(async (resolve) => {
-          const readline = await import("readline");
-          const rl = readline.createInterface({
-            input: process.stdin,
-            output: process.stdout
-          });
+          const rl = await createSafeReadlineInterface();
+          if (!rl) {
+            // TTY not available, continue without waiting
+            resolve();
+            return;
+          }
           rl.question("", () => {
             rl.close();
             resolve();
@@ -319,12 +321,13 @@ async function runSparcWorkflow(ctx: CommandContext): Promise<void> {
 
       if (workflow.sequential !== false && i < workflow.steps.length - 1) {
         console.log("Step completed. Press Enter to continue, or Ctrl+C to stop...");
-        await new Promise<void>((resolve) => {
-          const readline = require("readline");
-          const rl = readline.createInterface({
-            input: process.stdin,
-            output: process.stdout
-          });
+        await new Promise<void>(async (resolve) => {
+          const rl = await createSafeReadlineInterface();
+          if (!rl) {
+            // TTY not available, continue without waiting
+            resolve();
+            return;
+          }
           rl.question("", () => {
             rl.close();
             resolve();
